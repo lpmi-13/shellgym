@@ -20,18 +20,19 @@ import (
 
 func newServeCmd() *cobra.Command {
 	var (
-		pathDir string
-		addr       string
-		stateDir   string
-		runDir     string
-		shellUser  string
-		live       bool
+		pathDir   string
+		addr      string
+		stateDir  string
+		runDir    string
+		shellUser string
+		live      bool
+		execLog   string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the Shell Gym daemon (web UI + validation engine)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return serve(pathDir, addr, stateDir, runDir, shellUser, live)
+			return serve(pathDir, addr, stateDir, runDir, shellUser, execLog, live)
 		},
 	}
 	cmd.Flags().StringVar(&pathDir, "path", "", "learning path directory (required)")
@@ -39,13 +40,15 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateDir, "state", "/var/lib/shellgym", "state directory")
 	cmd.Flags().StringVar(&runDir, "run", "/run/shellgym", "runtime directory (socket, check shims)")
 	cmd.Flags().StringVar(&shellUser, "user", "", "observed login user (default: from path.yaml)")
+	cmd.Flags().StringVar(&execLog, "exec-log", "",
+		"path to append-only JSONL file for logging student commands (disabled when empty)")
 	cmd.Flags().BoolVar(&live, "live", false,
 		"student-facing mode: strip solve scripts from on-disk unit files and disable the debug API")
 	_ = cmd.MarkFlagRequired("path")
 	return cmd
 }
 
-func serve(pathDir, addr, stateDir, runDir, shellUser string, live bool) error {
+func serve(pathDir, addr, stateDir, runDir, shellUser, execLog string, live bool) error {
 	if live {
 		n, err := content.StripSolveScripts(pathDir)
 		if err != nil {
@@ -89,6 +92,17 @@ func serve(pathDir, addr, stateDir, runDir, shellUser string, live bool) error {
 	}
 	defer watcher.Close()
 	log.Printf("exec watcher: %s", watcher.Source)
+
+	if execLog != "" {
+		logger, err := engine.NewExecLogger(execLog)
+		if err != nil {
+			return err
+		}
+		defer logger.Close()
+		ch := watcher.Subscribe(256)
+		go logger.Run(ch)
+		log.Printf("exec logger: writing student commands to %s", execLog)
+	}
 
 	b := bus.New()
 	eng := engine.New(path, st, b, watcher, engine.Options{

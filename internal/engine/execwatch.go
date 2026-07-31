@@ -26,12 +26,24 @@ type ExecEvent struct {
 	// processes count as student activity: the daemon's own task scripts
 	// run in a fresh session with no controlling tty, which prevents a
 	// check's own argv (which contains the searched pattern) from matching.
-	TTYNr int      `json:"ttyNr"`
-	Argv  []string `json:"argv"`
+	TTYNr    int      `json:"ttyNr"`
+	Argv     []string `json:"argv"`
+	Cwd      string   `json:"cwd"`
+	// ExitCode is the process exit code, populated after the process exits.
+	// -1 means the exit event has not been received yet or the process exited
+	// before the exit event could be correlated.
+	ExitCode int `json:"exitCode"`
 	// Env is captured eagerly for tty-attached processes (student
 	// commands are low-rate; fast ones die before a lazy read could
 	// happen). Empty for tty-less processes.
 	Env []string `json:"-"`
+}
+
+// pendingExit tracks an exit event received before the exec event was
+// published (race: EXIT fires before the harvest goroutine finishes).
+type pendingExit struct {
+	code      int
+	expiresAt time.Time
 }
 
 // ExecWatcher records exec events into a bounded ring buffer, sourced from
@@ -45,6 +57,14 @@ type ExecWatcher struct {
 	seq    uint64
 	closed bool
 
+	// exitCodes holds exit codes for PIDs whose EXIT event arrived before
+	// (or just after) their exec event was published.  Entries expire after
+	// exitTTL to cap memory usage.
+	exitCodes map[int]pendingExit
+
+	// subscribers receive a copy of every published ExecEvent (logger etc.).
+	subscribers []chan ExecEvent
+
 	// Source is "netlink" when the connector is active, "" when exec
 	// watching is unavailable.
 	Source string
@@ -52,8 +72,11 @@ type ExecWatcher struct {
 
 const ringSize = 4096
 
+// exitTTL is how long an unmatched exit-code entry is kept before eviction.
+const exitTTL = 10 * time.Second
+
 func NewExecWatcher() *ExecWatcher {
-	w := &ExecWatcher{}
+	w := &ExecWatcher{exitCodes: map[int]pendingExit{}}
 	w.cond = sync.NewCond(&w.mu)
 	return w
 }
@@ -149,11 +172,72 @@ func (w *ExecWatcher) publish(ev ExecEvent) {
 	w.seq++
 	ev.Seq = w.seq
 	ev.Time = time.Now()
+	// Attach exit code if the EXIT event already arrived for this PID.
+	ev.ExitCode = -1
+	if pe, ok := w.exitCodes[ev.PID]; ok {
+		ev.ExitCode = pe.code
+		delete(w.exitCodes, ev.PID)
+	}
 	w.ring = append(w.ring, ev)
 	if len(w.ring) > ringSize {
 		w.ring = w.ring[len(w.ring)-ringSize:]
 	}
 	w.cond.Broadcast()
+	// Fan out to subscribers (non-blocking: drop if the channel is full).
+	for _, ch := range w.subscribers {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// recordExit stores the exit code for a PID. If an exec event for that PID
+// is already in the ring (EXIT fired after publish), update it in-place.
+func (w *ExecWatcher) recordExit(pid, code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Try to update an already-published event in the ring.
+	for i := len(w.ring) - 1; i >= 0; i-- {
+		if w.ring[i].PID == pid {
+			w.ring[i].ExitCode = code
+			// Notify subscribers of the updated event so the logger can
+			// write the final record.
+			for _, ch := range w.subscribers {
+				select {
+				case ch <- w.ring[i]:
+				default:
+				}
+			}
+			w.cond.Broadcast()
+			return
+		}
+	}
+	// EXIT arrived before the harvest goroutine finished; stash for publish.
+	w.evictExpiredLocked()
+	w.exitCodes[pid] = pendingExit{code: code, expiresAt: time.Now().Add(exitTTL)}
+}
+
+// evictExpiredLocked removes stale entries from exitCodes. Must be called
+// with w.mu held.
+func (w *ExecWatcher) evictExpiredLocked() {
+	now := time.Now()
+	for pid, pe := range w.exitCodes {
+		if now.After(pe.expiresAt) {
+			delete(w.exitCodes, pid)
+		}
+	}
+}
+
+// Subscribe returns a channel that receives a copy of every published
+// ExecEvent. The caller must drain the channel promptly; events are dropped
+// (not queued beyond bufSize) to avoid blocking the watcher.
+func (w *ExecWatcher) Subscribe(bufSize int) <-chan ExecEvent {
+	ch := make(chan ExecEvent, bufSize)
+	w.mu.Lock()
+	w.subscribers = append(w.subscribers, ch)
+	w.mu.Unlock()
+	return ch
 }
 
 // --- netlink proc connector -------------------------------------------------
@@ -163,6 +247,7 @@ const (
 	cnValProc         = 1
 	procCnMcastListen = 1
 	procEventExec     = 0x00000002
+	procEventExit     = 0x00000004
 	nlMsgDone         = 0x3
 )
 
@@ -248,7 +333,8 @@ func (w *ExecWatcher) netlinkLoop(sock int) {
 			pe := off + 16 + 20
 			if pe+16 <= n {
 				what := le.Uint32(buf[pe:])
-				if what == procEventExec {
+				switch what {
+				case procEventExec:
 					// exec event: process pid at pe+16 (after what, cpu, timestamp[8])
 					pid := int(le.Uint32(buf[pe+16:]))
 					// Harvest concurrently: a burst of execs (shell pipelines,
@@ -260,6 +346,13 @@ func (w *ExecWatcher) netlinkLoop(sock int) {
 							w.publish(ev)
 						}
 					}(pid)
+				case procEventExit:
+					// exit event layout: pid at pe+16, exit_code at pe+20
+					if pe+24 <= n {
+						pid := int(le.Uint32(buf[pe+16:]))
+						exitCode := int(le.Uint32(buf[pe+20:]))
+						w.recordExit(pid, exitCode)
+					}
 				}
 			}
 			off += nlmsgAlign(msgLen)
@@ -306,7 +399,11 @@ func harvestProc(pid int) (ExecEvent, bool) {
 			ppid, _ = strconv.Atoi(strings.TrimSpace(v))
 		}
 	}
-	ev := ExecEvent{PID: pid, PPID: ppid, UID: uid, TTYNr: ttyNr, Argv: argv}
+	ev := ExecEvent{PID: pid, PPID: ppid, UID: uid, TTYNr: ttyNr, Argv: argv, ExitCode: -1}
+	// Capture working directory; may fail for very short-lived processes.
+	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
+		ev.Cwd = cwd
+	}
 	if ttyNr != 0 {
 		// Eager env capture (bounded): fast interactive commands are gone
 		// before wait_env could read /proc lazily.
