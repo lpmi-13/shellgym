@@ -123,11 +123,43 @@ the successful resuming of the learning path may depend on the preservation
 of system's state. For instance, if another process removes or modifes files
 required by the learning path, it may break the restart, and the progress will be reset.
 
+## Exporting command history
+
+Pass `--exec-log <path>` to `shellgym serve` to record every command the student runs into an append-only [JSONL](https://jsonlines.org/) file (one JSON object per line):
+
+```sh
+sudo ./shellgym serve --path "$PWD/paths/sample-linux-101" --user $USER \
+    --exec-log /var/log/shellgym-commands.jsonl
+```
+
+Each line captures the full context of one command execution:
+
+| Field | Type | Description |
+|---|---|---|
+| `seq` | number | Monotonically increasing event sequence number |
+| `time` | string (RFC3339) | Wall-clock time the exec was observed |
+| `pid` | number | Process ID |
+| `ppid` | number | Parent process ID |
+| `uid` | number | UID of the process owner |
+| `ttyNr` | number | Controlling terminal device number (`-1` = unknown, `0` = none/daemon) |
+| `argv` | array of strings | Full command and arguments (`["ls", "-la", "/tmp"]`) |
+| `cwd` | string | Working directory at exec time (empty string if the process exited before it could be read) |
+| `exitCode` | number | Process exit code (`-1` if not yet received or unavailable) |
+
+**Example record:**
+```json
+{"seq":42,"time":"2026-07-31T08:00:01.123Z","pid":4711,"ppid":4700,"uid":1000,"ttyNr":34816,"argv":["ls","-la","/tmp"],"cwd":"/home/student","exitCode":0}
+```
+
+Only student commands (TTY-attached processes) are written; daemon-internal check scripts are excluded.
+
+Exit codes are written in a separate follow-up line carrying the same `seq` when the kernel exit event arrives slightly after the initial exec record. Consumers should take the last record for a given `seq` as authoritative. If no follow-up line appears, `exitCode` remains `-1` (this is normal for very short-lived processes where the exit event may be lost to a netlink buffer overflow).
+
 ## Main CLI commands
 
 | &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; Command &nbsp; &nbsp; &nbsp; &nbsp; | What it does |
 |---|---|
-| `shellgym serve` | The daemon itself: loads a path, runs the validation engine, serves the web UI |
+| `shellgym serve` | The daemon itself: loads a path, runs the validation engine, serves the web UI. Pass `--exec-log <path>` to stream student commands to a JSONL file |
 | `shellgym validate` | Lints and renders a path without running it |
 | `shellgym solve` | Auto-types reference solutions into a real pty shell, simulating a student pass |
 | `shellgym skills` | Prints embedded authoring guides for AI-assisted content work |
